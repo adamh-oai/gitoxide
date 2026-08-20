@@ -1922,6 +1922,7 @@ dependencies = [
  "bstr",
  "defer",
  "dunce",
+ "gix-error",
  "gix-fs",
  "gix-path",
  "gix-ref",
@@ -1930,7 +1931,6 @@ dependencies = [
  "is_ci",
  "serial_test",
  "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1705,6 +1705,7 @@ dependencies = [
  "bstr",
  "criterion",
  "document-features",
+ "gix-error",
  "gix-features",
  "gix-fs",
  "gix-glob",
@@ -1714,7 +1715,6 @@ dependencies = [
  "gix-trace",
  "serde",
  "smallvec",
- "thiserror 2.0.18",
  "unicode-bom",
 ]
 

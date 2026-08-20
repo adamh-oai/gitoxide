@@ -400,7 +400,7 @@ fn tree_additions_from_each_merge_parent_are_kept() -> crate::Result {
         .take_object_memory()
         .expect("in-memory object storage is still enabled");
     let db = gix_pack::testing::Memory::new(objects.drain());
-    let mut input = std::iter::once(Ok::<_, Box<dyn std::error::Error + Send + Sync>>(merge_commit_id));
+    let mut input = std::iter::once(Ok::<_, gix_error::Exn>(merge_commit_id));
 
     let (counts, stats) = output::count::objects_unthreaded(
         &db,

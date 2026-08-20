@@ -1,8 +1,5 @@
 #![allow(clippy::result_large_err)]
-use std::{
-    error::Error,
-    fmt::{Debug, Formatter},
-};
+use std::fmt::{Debug, Formatter};
 
 use gix_config::KeyRef;
 
@@ -141,7 +138,13 @@ impl<T: Validate> Key for Any<T> {
     }
 
     fn validate(&self, value: &BStr) -> Result<(), config::tree::key::validate::Error> {
-        Ok(self.validate.validate(value)?)
+        self.validate.validate(value).map_err(|err| {
+            err.raise(gix_error::ValidationError::new_with_input(
+                format!("Invalid value for configuration key '{}'", self.logical_name()),
+                value,
+            ))
+            .into()
+        })
     }
 
     fn section(&self) -> &dyn Section {
@@ -563,12 +566,14 @@ mod remote_name {
 /// Provide a way to validate a value, or decode a value from `git-config`.
 pub trait Validate {
     /// Validate `value` or return an error.
-    fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>>;
+    fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn>;
 }
 
 /// various implementations of the `Validate` trait.
 pub mod validate {
-    use std::{borrow::Cow, error::Error};
+    use std::borrow::Cow;
+
+    use gix_error::{ErrorExt, ResultExt, message};
 
     use crate::{
         bstr::{BStr, ByteSlice},
@@ -581,7 +586,7 @@ pub mod validate {
     pub struct All;
 
     impl Validate for All {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result<(), gix_error::Exn> {
             Ok(())
         }
     }
@@ -591,8 +596,8 @@ pub mod validate {
     pub struct Time;
 
     impl Validate for Time {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-            gix_date::parse(value.to_str()?, gix_date::Zoned::now().into()).map_err(gix_error::Exn::into_inner)?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            gix_date::parse(value.to_str().or_erased()?, gix_date::Zoned::now().into()).or_erased()?;
             Ok(())
         }
     }
@@ -602,13 +607,14 @@ pub mod validate {
     pub struct UnsignedInteger;
 
     impl Validate for UnsignedInteger {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
             usize::try_from(
-                gix_config::Integer::try_from(value)?
+                gix_config::Integer::try_from(value)
+                    .or_erased()?
                     .to_decimal()
-                    .ok_or_else(|| format!("integer {value} cannot be represented as `usize`"))?,
+                    .ok_or_else(|| message!("integer {value} cannot be represented as `usize`").raise_erased())?,
             )
-            .map_err(|_| "cannot use sign for unsigned integer")?;
+            .map_err(|_| message("cannot use sign for unsigned integer").raise_erased())?;
             Ok(())
         }
     }
@@ -618,8 +624,8 @@ pub mod validate {
     pub struct Boolean;
 
     impl Validate for Boolean {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-            gix_config::Boolean::try_from(value)?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            gix_config::Boolean::try_from(value).or_erased()?;
             Ok(())
         }
     }
@@ -643,9 +649,9 @@ pub mod validate {
     }
 
     impl Validate for FullNameRef {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
             if !self.allow_empty || !value.is_empty() {
-                gix_ref::FullName::try_from(value.to_owned())?;
+                gix_ref::FullName::try_from(value.to_owned()).or_erased()?;
             }
             Ok(())
         }
@@ -655,9 +661,9 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct RemoteName;
     impl Validate for RemoteName {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
             remote::Name::try_from(Cow::Borrowed(value))
-                .map_err(|_| format!("Illformed UTF-8 in remote name: \"{}\"", value.to_str_lossy()))?;
+                .map_err(|_| message!("Illformed UTF-8 in remote name: \"{}\"", value.to_str_lossy()).raise_erased())?;
             Ok(())
         }
     }
@@ -666,7 +672,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Program;
     impl Validate for Program {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result<(), gix_error::Exn> {
             Ok(())
         }
     }
@@ -675,7 +681,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Executable;
     impl Validate for Executable {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result<(), gix_error::Exn> {
             Ok(())
         }
     }
@@ -684,8 +690,8 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Url;
     impl Validate for Url {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            gix_url::parse(value)?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            gix_url::parse(value).or_erased()?;
             Ok(())
         }
     }
@@ -694,8 +700,8 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct PushRefSpec;
     impl Validate for PushRefSpec {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            gix_refspec::parse(value, gix_refspec::parse::Operation::Push).map_err(gix_error::Exn::into_error)?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            gix_refspec::parse(value, gix_refspec::parse::Operation::Push).or_erased()?;
             Ok(())
         }
     }
@@ -704,8 +710,8 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct FetchRefSpec;
     impl Validate for FetchRefSpec {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            gix_refspec::parse(value, gix_refspec::parse::Operation::Fetch).map_err(gix_error::Exn::into_error)?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            gix_refspec::parse(value, gix_refspec::parse::Operation::Fetch).or_erased()?;
             Ok(())
         }
     }
@@ -714,11 +720,14 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct LockTimeout;
     impl Validate for LockTimeout {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            let value = gix_config::Integer::try_from(value)
+                .or_erased()?
                 .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::Core::FILES_REF_LOCK_TIMEOUT.try_into_lock_timeout(Ok(Some(value?)))?;
+                .ok_or_else(|| message!("integer {value} cannot be represented as integer").raise_erased())?;
+            super::super::Core::FILES_REF_LOCK_TIMEOUT
+                .try_into_lock_timeout(Ok(Some(value)))
+                .or_erased()?;
             Ok(())
         }
     }
@@ -727,11 +736,14 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct Compression;
     impl Validate for Compression {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            let value = gix_config::Integer::try_from(value)
+                .or_erased()?
                 .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::Core::COMPRESSION.try_into_compression(Ok(Some(value?)))?;
+                .ok_or_else(|| message!("integer {value} cannot be represented as integer").raise_erased())?;
+            super::super::Core::COMPRESSION
+                .try_into_compression(Ok(Some(value)))
+                .or_erased()?;
             Ok(())
         }
     }
@@ -740,11 +752,14 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct DurationInMilliseconds;
     impl Validate for DurationInMilliseconds {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            let value = gix_config::Integer::try_from(value)
+                .or_erased()?
                 .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::gitoxide::Http::CONNECT_TIMEOUT.try_into_duration(Ok(Some(value?)))?;
+                .ok_or_else(|| message!("integer {value} cannot be represented as integer").raise_erased())?;
+            super::super::gitoxide::Http::CONNECT_TIMEOUT
+                .try_into_duration(Ok(Some(value)))
+                .or_erased()?;
             Ok(())
         }
     }
@@ -753,8 +768,8 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct String;
     impl Validate for String {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            value.to_str()?;
+        fn validate(&self, value: &BStr) -> Result<(), gix_error::Exn> {
+            value.to_str().or_erased()?;
             Ok(())
         }
     }
@@ -763,7 +778,7 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct Path;
     impl Validate for Path {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result<(), gix_error::Exn> {
             Ok(())
         }
     }

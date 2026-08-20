@@ -2180,7 +2180,6 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "termtree",
- "thiserror 2.0.18",
 ]
 
 [[package]]

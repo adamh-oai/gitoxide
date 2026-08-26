@@ -62,15 +62,11 @@ pub struct UntrackedCache {
 }
 
 /// The extension for keeping state on recent information provided by the filesystem monitor.
-#[expect(
-    dead_code,
-    reason = "for the time when we know what to do with it, for now we just ser-de it"
-)]
 #[derive(Clone)]
 pub struct FsMonitor {
-    token: fs_monitor::Token,
+    pub(crate) token: fs_monitor::Token,
     /// if a bit is true, the respective entry is NOT valid as per the fs monitor.
-    entry_dirty: gix_bitmap::ewah::Vec,
+    pub(crate) entry_dirty: gix_bitmap::ewah::Vec,
 }
 
 mod iter;

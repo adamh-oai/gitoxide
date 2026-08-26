@@ -89,6 +89,156 @@ fn skip_hash() -> crate::Result {
 }
 
 #[test]
+fn fsmonitor_v1_extension_roundtrips() -> crate::Result {
+    if gix_testtools::object_hash() != gix_hash::Kind::Sha1 {
+        return Ok(());
+    }
+
+    let expected = Loose("FSMN").open();
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+
+    let (actual, _) = State::from_bytes(&encoded, FileTime::now(), gix_hash::Kind::Sha1, Default::default())?;
+    assert!(
+        actual.fs_monitor().is_some(),
+        "writing an index must preserve its existing v1 fsmonitor extension"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_v2_token_and_dirty_bitmap_roundtrip() -> crate::Result {
+    let mut expected = Generated("v2_more_files").open();
+    let mut dirty = vec![false; expected.entries().len()];
+    dirty[1] = true;
+    dirty[4] = true;
+    expected.set_fs_monitor(
+        extension::FsMonitor::from_token("awacs-git-v2:owner:filesystem:snapshot:cursor", &dirty)
+            .expect("fixture entry count must fit in a Git index bitmap"),
+    );
+
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let monitor = actual
+        .fs_monitor()
+        .expect("writing an index must preserve its existing v2 fsmonitor extension");
+    assert_eq!(
+        monitor.token(),
+        Some("awacs-git-v2:owner:filesystem:snapshot:cursor".into()),
+        "the opaque fsmonitor cursor must remain unchanged"
+    );
+
+    let mut dirty_entries = Vec::new();
+    assert_eq!(
+        monitor.for_each_dirty_entry(|index| {
+            dirty_entries.push(index);
+            Some(())
+        }),
+        Some(()),
+        "the serialized dirty-entry bitmap must remain valid"
+    );
+    assert_eq!(
+        dirty_entries,
+        vec![1, 4],
+        "dirty index positions must survive serialization"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_bitmap_tracks_insertions_removals_and_sorting() -> crate::Result {
+    let mut index = Generated("v2_more_files").open();
+    let mut dirty = vec![false; index.entries().len()];
+    dirty[1] = true;
+    index.set_fs_monitor(
+        extension::FsMonitor::from_token("cursor", &dirty).expect("fixture entry count must fit in a Git index bitmap"),
+    );
+    let object_id = index.entries()[0].id;
+
+    index.edit_preserving_fs_monitor(|state| {
+        state.remove_entry_at_index(0);
+        state.dangerously_push_entry(
+            entry::Stat::default(),
+            object_id,
+            entry::Flags::empty(),
+            entry::Mode::FILE,
+            "aa".into(),
+        );
+        state.sort_entries();
+    });
+
+    let mut encoded = Vec::new();
+    index.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let mut dirty_paths = Vec::new();
+    actual
+        .fs_monitor()
+        .expect("editing entries must preserve the fsmonitor extension")
+        .for_each_dirty_entry(|index| {
+            dirty_paths.push(actual.entries()[index].path(&actual).to_owned());
+            Some(())
+        })
+        .expect("remapped dirty-entry bitmap must remain valid");
+    assert_eq!(
+        dirty_paths,
+        vec![bstr::BString::from("aa"), bstr::BString::from("b")],
+        "new entries and previously dirty entries must stay dirty after removal and sorting"
+    );
+    assert!(
+        index
+            .entries()
+            .iter()
+            .all(|entry| !entry.flags.contains(entry::Flags::FSMONITOR_VALID)),
+        "temporary fsmonitor validity flags must not leak into gitoxide status operations"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_state_can_be_inherited_by_a_rebuilt_index() -> crate::Result {
+    let mut source = Generated("v2_more_files").open();
+    let mut dirty = vec![false; source.entries().len()];
+    dirty[1] = true;
+    source.set_fs_monitor(
+        extension::FsMonitor::from_token("retained-cursor", &dirty)
+            .expect("fixture entry count must fit in a Git index bitmap"),
+    );
+
+    let mut rebuilt = Generated("v2_more_files").open();
+    rebuilt.entries_mut()[2].id = gix_hash::ObjectId::null(gix_testtools::object_hash());
+    rebuilt.inherit_fs_monitor_from(&source);
+
+    let monitor = rebuilt
+        .fs_monitor()
+        .expect("a rebuilt index must inherit the old fsmonitor extension");
+    assert_eq!(monitor.token(), Some("retained-cursor".into()));
+    let mut dirty_entries = Vec::new();
+    monitor
+        .for_each_dirty_entry(|index| {
+            dirty_entries.push(index);
+            Some(())
+        })
+        .expect("inherited dirty-entry bitmap must remain valid");
+    assert_eq!(
+        dirty_entries,
+        vec![1, 2],
+        "previously dirty entries and changed object IDs must both be invalidated"
+    );
+    Ok(())
+}
+
+#[test]
 fn roundtrips_sparse_index() -> crate::Result {
     // NOTE: I initially tried putting these fixtures into the main roundtrip test above,
     // but the call to `compare_raw_bytes` panics. It seems like git is using a different

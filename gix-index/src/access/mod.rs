@@ -654,6 +654,103 @@ impl State {
     pub fn fs_monitor(&self) -> Option<&extension::FsMonitor> {
         self.fs_monitor.as_ref()
     }
+
+    /// Replace the filesystem monitor extension, returning the previously installed extension, if any.
+    pub fn set_fs_monitor(&mut self, monitor: extension::FsMonitor) -> Option<extension::FsMonitor> {
+        self.fs_monitor.replace(monitor)
+    }
+
+    /// Apply `edit` while preserving the filesystem monitor cursor and remapping dirty entries.
+    ///
+    /// Existing clean entries carry a temporary in-memory `FSMONITOR_VALID` flag while the callback
+    /// runs. Newly inserted entries are dirty unless the callback explicitly marks them valid;
+    /// callbacks modifying an existing entry must clear its `FSMONITOR_VALID` flag. The temporary
+    /// flags are cleared before returning so unrelated status operations cannot trust an unqueried
+    /// monitor cursor.
+    pub fn edit_preserving_fs_monitor<T>(&mut self, edit: impl FnOnce(&mut Self) -> T) -> T {
+        let Some(mut monitor) = self.fs_monitor.take() else {
+            return edit(self);
+        };
+
+        for entry in &mut self.entries {
+            entry.flags.insert(entry::Flags::FSMONITOR_VALID);
+        }
+        if monitor
+            .for_each_dirty_entry(|idx| {
+                self.entries.get_mut(idx)?.flags.remove(entry::Flags::FSMONITOR_VALID);
+                Some(())
+            })
+            .is_none()
+        {
+            for entry in &mut self.entries {
+                entry.flags.remove(entry::Flags::FSMONITOR_VALID);
+            }
+        }
+
+        let result = edit(self);
+        let dirty_entries: Vec<bool> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.flags.contains(entry::Flags::REMOVE))
+            .map(|entry| !entry.flags.contains(entry::Flags::FSMONITOR_VALID))
+            .collect();
+        monitor.entry_dirty = gix_bitmap::ewah::Vec::from_bits(&dirty_entries)
+            .expect("Git indexes cannot contain more than u32::MAX entries");
+        for entry in &mut self.entries {
+            entry.flags.remove(entry::Flags::FSMONITOR_VALID);
+        }
+        self.fs_monitor = Some(monitor);
+        result
+    }
+
+    /// Carry the filesystem monitor cursor from `source` into this rebuilt index.
+    ///
+    /// Preserve the dirty state of entries whose path, stage, object ID, and mode are unchanged;
+    /// mark every new or modified entry dirty. Both indexes must have their entries sorted.
+    pub fn inherit_fs_monitor_from(&mut self, source: &State) {
+        let Some(monitor) = source.fs_monitor.as_ref() else {
+            return;
+        };
+
+        let mut source_dirty = vec![false; source.entries.len()];
+        if monitor
+            .for_each_dirty_entry(|idx| {
+                *source_dirty.get_mut(idx)? = true;
+                Some(())
+            })
+            .is_none()
+        {
+            source_dirty.fill(true);
+        }
+
+        let mut dirty_entries = vec![true; self.entries.len()];
+        let mut source_idx = 0;
+        let mut target_idx = 0;
+        while let (Some(source_entry), Some(target_entry)) =
+            (source.entries.get(source_idx), self.entries.get(target_idx))
+        {
+            match Entry::cmp_filepaths(source_entry.path(source), target_entry.path(self))
+                .then_with(|| source_entry.stage().cmp(&target_entry.stage()))
+            {
+                Ordering::Less => source_idx += 1,
+                Ordering::Greater => target_idx += 1,
+                Ordering::Equal => {
+                    if source_entry.id == target_entry.id && source_entry.mode == target_entry.mode {
+                        dirty_entries[target_idx] = source_dirty[source_idx];
+                    }
+                    source_idx += 1;
+                    target_idx += 1;
+                }
+            }
+        }
+
+        self.fs_monitor = Some(extension::FsMonitor {
+            token: monitor.token.clone(),
+            entry_dirty: gix_bitmap::ewah::Vec::from_bits(&dirty_entries)
+                .expect("Git indexes cannot contain more than u32::MAX entries"),
+        });
+    }
+
     /// Return `true` if the end-of-index extension was present when decoding this index.
     pub fn had_end_of_index_marker(&self) -> bool {
         self.end_of_index_at_decode_time

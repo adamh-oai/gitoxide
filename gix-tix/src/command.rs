@@ -426,14 +426,14 @@ impl Platform {
         if self.command.is_some() {
             let opens_worktree_picker = matches!(
                 self.command,
-                Some(Command::Worktrunk { command: None })
-                    | Some(Command::Worktrunk {
-                        command: Some(WorktrunkCommand::Switch {
+                Some(Command::Worktrunk {
+                    command: None
+                        | Some(WorktrunkCommand::Switch {
                             target: None,
                             new_branch: None,
                             path: None,
-                        })
-                    })
+                        }),
+                })
             );
             anyhow::ensure!(
                 !self.no_alt_screen

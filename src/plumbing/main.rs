@@ -340,6 +340,32 @@ pub fn main() -> Result<()> {
                 None,
                 move |_progress, out, _err| core::repository::worktree::list(repository(Mode::Lenient)?, out, format),
             ),
+            crate::plumbing::options::worktree::SubCommands::Add {
+                detach,
+                path,
+                reference,
+            } => prepare_and_run(
+                "worktree-add",
+                trace,
+                verbose,
+                progress,
+                progress_keep_open,
+                None,
+                move |progress, _out, _err| {
+                    core::repository::worktree::add(repository(Mode::Lenient)?, path, reference, detach, progress)
+                },
+            ),
+            crate::plumbing::options::worktree::SubCommands::Remove { force, worktree } => prepare_and_run(
+                "worktree-remove",
+                trace,
+                verbose,
+                progress,
+                progress_keep_open,
+                None,
+                move |progress, _out, _err| {
+                    core::repository::worktree::remove(repository(Mode::Lenient)?, worktree, force, progress)
+                },
+            ),
         },
         Subcommands::IsClean | Subcommands::IsChanged => {
             let mode = if matches!(cmd, Subcommands::IsClean) {

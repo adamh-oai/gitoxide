@@ -127,6 +127,14 @@ impl State {
             },
             &|write| {
                 extensions
+                    .should_write(extension::untracked_cache::SIGNATURE)
+                    .and_then(|signature| {
+                        self.untracked()
+                            .map(|cache| cache.write_to(write, self.object_hash).map(|_| signature))
+                    })
+            },
+            &|write| {
+                extensions
                     .should_write(extension::fs_monitor::SIGNATURE)
                     .and_then(|signature| {
                         self.fs_monitor()

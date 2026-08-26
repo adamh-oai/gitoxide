@@ -650,6 +650,15 @@ impl State {
     pub fn untracked(&self) -> Option<&extension::UntrackedCache> {
         self.untracked.as_ref()
     }
+
+    /// Carry the untracked-cache extension from `source` into this rebuilt index.
+    ///
+    /// The caller must ensure both indexes describe the same worktree, since the cache contains
+    /// worktree-specific directory snapshots and exclude metadata.
+    pub fn inherit_untracked_from(&mut self, source: &State) {
+        self.untracked.clone_from(&source.untracked);
+    }
+
     /// Obtain the fsmonitor extension.
     pub fn fs_monitor(&self) -> Option<&extension::FsMonitor> {
         self.fs_monitor.as_ref()

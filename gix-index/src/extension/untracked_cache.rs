@@ -37,6 +37,138 @@ impl UntrackedCache {
     pub fn directories(&self) -> &[Directory] {
         &self.directories
     }
+
+    pub(crate) fn write_to(&self, mut out: impl std::io::Write, object_hash: gix_hash::Kind) -> std::io::Result<()> {
+        let mut payload = Vec::new();
+        write_var_int(&mut payload, self.identifier.len())?;
+        payload.extend_from_slice(&self.identifier);
+
+        write_stat(&mut payload, self.info_exclude.as_ref().map(|entry| &entry.stat))?;
+        write_stat(&mut payload, self.excludes_file.as_ref().map(|entry| &entry.stat))?;
+        payload.extend_from_slice(&self.dir_flags.to_be_bytes());
+        write_object_id(
+            &mut payload,
+            self.info_exclude.as_ref().map(|entry| entry.id),
+            object_hash,
+        )?;
+        write_object_id(
+            &mut payload,
+            self.excludes_file.as_ref().map(|entry| entry.id),
+            object_hash,
+        )?;
+        payload.extend_from_slice(&self.exclude_filename_per_dir);
+        payload.push(0);
+
+        write_var_int(&mut payload, self.directories.len())?;
+        if !self.directories.is_empty() {
+            self.write_directory(&mut payload, 0)?;
+
+            let valid: Vec<bool> = self
+                .directories
+                .iter()
+                .map(|directory| directory.stat.is_some())
+                .collect();
+            let check_only: Vec<bool> = self.directories.iter().map(|directory| directory.check_only).collect();
+            let hash_valid: Vec<bool> = self
+                .directories
+                .iter()
+                .map(|directory| directory.exclude_file_oid.is_some())
+                .collect();
+            for bitmap in [&valid, &check_only, &hash_valid] {
+                gix_bitmap::ewah::Vec::from_bits(bitmap)
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "untracked-cache bitmap exceeds 4GB")
+                    })?
+                    .write_to(&mut payload)?;
+            }
+
+            for directory in &self.directories {
+                if let Some(stat) = directory.stat.as_ref() {
+                    write_stat(&mut payload, Some(stat))?;
+                }
+            }
+            for directory in &self.directories {
+                if let Some(object_id) = directory.exclude_file_oid {
+                    write_object_id(&mut payload, Some(object_id), object_hash)?;
+                }
+            }
+            payload.push(0);
+        }
+
+        let payload_size = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "untracked-cache extension exceeds 4GB",
+            )
+        })?;
+        out.write_all(&SIGNATURE)?;
+        out.write_all(&payload_size.to_be_bytes())?;
+        out.write_all(&payload)
+    }
+
+    fn write_directory(&self, out: &mut Vec<u8>, index: usize) -> std::io::Result<()> {
+        let directory = self.directories.get(index).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "untracked-cache directory references an invalid child",
+            )
+        })?;
+        write_var_int(&mut *out, directory.untracked_entries.len())?;
+        write_var_int(&mut *out, directory.sub_directories.len())?;
+        out.extend_from_slice(&directory.name);
+        out.push(0);
+        for entry in &directory.untracked_entries {
+            out.extend_from_slice(entry);
+            out.push(0);
+        }
+        for &child in &directory.sub_directories {
+            self.write_directory(out, child)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_var_int(mut out: impl std::io::Write, value: usize) -> std::io::Result<()> {
+    let mut value = u64::try_from(value)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "untracked-cache count exceeds u64"))?;
+    let mut encoded = [0_u8; 10];
+    let mut position = encoded.len() - 1;
+    encoded[position] = (value & 0x7f) as u8;
+    while {
+        value >>= 7;
+        value != 0
+    } {
+        value -= 1;
+        position -= 1;
+        encoded[position] = 0x80 | (value & 0x7f) as u8;
+    }
+    out.write_all(&encoded[position..])
+}
+
+fn write_stat(mut out: impl std::io::Write, stat: Option<&entry::Stat>) -> std::io::Result<()> {
+    let stat = stat.copied().unwrap_or_default();
+    for value in [
+        stat.ctime.secs,
+        stat.ctime.nsecs,
+        stat.mtime.secs,
+        stat.mtime.nsecs,
+        stat.dev,
+        stat.ino,
+        stat.uid,
+        stat.gid,
+        stat.size,
+    ] {
+        out.write_all(&value.to_be_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_object_id(
+    mut out: impl std::io::Write,
+    object_id: Option<ObjectId>,
+    object_hash: gix_hash::Kind,
+) -> std::io::Result<()> {
+    out.write_all(object_id.unwrap_or_else(|| ObjectId::null(object_hash)).as_bytes())
 }
 
 /// A structure to track filesystem stat information along with an object id, linking a worktree file with what's in our ODB.

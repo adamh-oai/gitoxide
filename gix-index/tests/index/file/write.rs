@@ -239,6 +239,81 @@ fn fsmonitor_state_can_be_inherited_by_a_rebuilt_index() -> crate::Result {
 }
 
 #[test]
+fn untracked_cache_extensions_roundtrip() -> crate::Result {
+    let object_hash = gix_testtools::object_hash();
+    let mut fixtures = vec![
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_empty"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_populated"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_nested"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+    ];
+    if object_hash == gix_hash::Kind::Sha1 {
+        fixtures.push(Loose("UNTR").open());
+        fixtures.push(Loose("UNTR-with-oids").open());
+    }
+
+    for expected in fixtures {
+        let expected_cache = expected
+            .untracked()
+            .expect("each fixture must contain an untracked-cache extension");
+        let mut encoded = Vec::new();
+        expected.write_to(&mut encoded, Options::default())?;
+        let (actual, _) = State::from_bytes(&encoded, FileTime::now(), object_hash, Default::default())?;
+        let actual_cache = actual
+            .untracked()
+            .expect("writing an index must preserve its untracked-cache extension");
+        assert_eq!(
+            format!("{actual_cache:?}"),
+            format!("{expected_cache:?}"),
+            "the identifier, exclude metadata, directory graph, bitmaps, stats, and object IDs must survive"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn untracked_cache_can_be_inherited_by_a_rebuilt_index() -> crate::Result {
+    let object_hash = gix_testtools::object_hash();
+    let source = gix_index::File::at(
+        crate::fixture_index_path_needs_archive("untracked_cache_nested"),
+        object_hash,
+        false,
+        Default::default(),
+    )?;
+    let mut rebuilt = Generated("v2_more_files").open();
+    assert!(
+        rebuilt.untracked().is_none(),
+        "the rebuilt index starts without an untracked cache"
+    );
+
+    rebuilt.inherit_untracked_from(&source);
+    let expected_cache = source.untracked().expect("the source fixture has an untracked cache");
+    let actual_cache = rebuilt
+        .untracked()
+        .expect("a rebuilt index must inherit the source untracked-cache extension");
+    assert_eq!(
+        format!("{actual_cache:?}"),
+        format!("{expected_cache:?}"),
+        "rebuilding the index must preserve the complete nested untracked-cache state"
+    );
+    Ok(())
+}
+
+#[test]
 fn roundtrips_sparse_index() -> crate::Result {
     // NOTE: I initially tried putting these fixtures into the main roundtrip test above,
     // but the call to `compare_raw_bytes` panics. It seems like git is using a different

@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use tracing_subscriber::{filter::Targets, prelude::*};
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    prelude::*,
+};
 
 const FILE_PREFIX: &str = "tix.log";
 const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -332,8 +335,51 @@ fn classify_reference_path(path: &Path, git_dir: &Path, common_dir: &Path) -> Tr
     }
 }
 
-pub(crate) fn init() -> Option<tracing::subscriber::DefaultGuard> {
-    try_init().ok()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraceFormat {
+    Forest,
+    Flat,
+}
+
+fn trace_settings(trace: u8) -> Option<(TraceFormat, LevelFilter)> {
+    match trace {
+        1 => Some((TraceFormat::Forest, LevelFilter::INFO)),
+        2 => Some((TraceFormat::Forest, LevelFilter::DEBUG)),
+        3 => Some((TraceFormat::Flat, LevelFilter::DEBUG)),
+        4 => Some((TraceFormat::Flat, LevelFilter::TRACE)),
+        _ => None,
+    }
+}
+
+pub(crate) fn init(trace: u8) -> Result<Option<tracing::subscriber::DefaultGuard>> {
+    if trace == 0 {
+        return Ok(try_init().ok());
+    }
+    try_init_trace(trace)?;
+    tracing::info!(trace, "started tix invocation");
+    Ok(None)
+}
+
+fn try_init_trace(trace: u8) -> Result<()> {
+    let (format, level) = trace_settings(trace).context("trace level must be between one and four")?;
+    match format {
+        TraceFormat::Forest => {
+            let printer = tracing_forest::Printer::new().writer(tracing_forest::printer::MakeStderr);
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(tracing_forest::ForestLayer::from(printer).with_filter(level)),
+            )?;
+        }
+        TraceFormat::Flat => {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(level),
+                ),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn try_init() -> Result<tracing::subscriber::DefaultGuard> {
@@ -425,6 +471,17 @@ mod tests {
 
     fn modified(path: impl Into<PathBuf>) -> notify::Event {
         notify::Event::new(notify::EventKind::Modify(ModifyKind::Any)).add_path(path.into())
+    }
+
+    #[test]
+    fn trace_repetitions_choose_format_and_level() {
+        assert_eq!(trace_settings(0), None);
+        assert_eq!(trace_settings(1), Some((TraceFormat::Forest, LevelFilter::INFO)));
+        assert_eq!(trace_settings(2), Some((TraceFormat::Forest, LevelFilter::DEBUG)));
+        assert_eq!(trace_settings(3), Some((TraceFormat::Flat, LevelFilter::DEBUG)));
+        assert_eq!(trace_settings(4), Some((TraceFormat::Flat, LevelFilter::TRACE)));
+        assert_eq!(trace_settings(5), None);
+        assert!(try_init_trace(5).is_err(), "invalid programmatic levels are reported");
     }
 
     #[test]

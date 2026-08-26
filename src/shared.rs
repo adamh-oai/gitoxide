@@ -52,7 +52,7 @@ pub mod pretty {
     #[cfg(feature = "small")]
     pub fn prepare_and_run<T>(
         name: &str,
-        trace: bool,
+        trace: u8,
         verbose: bool,
         progress: bool,
         #[cfg_attr(not(feature = "prodash-render-tui"), allow(unused_variables))] progress_keep_open: bool,
@@ -67,21 +67,25 @@ pub mod pretty {
 
         match (verbose, progress) {
             (false, false) => {
+                init_tracing(trace, false, None)?;
                 let stdout = stdout();
                 let mut stdout_lock = stdout.lock();
                 let stderr = stderr();
                 let mut stderr_lock = stderr.lock();
-                run(progress::DoOrDiscard::from(None), &mut stdout_lock, &mut stderr_lock)
+                gix::trace::coarse!("run")
+                    .into_scope(|| run(progress::DoOrDiscard::from(None), &mut stdout_lock, &mut stderr_lock))
             }
             (true, false) => {
-                let progress = crate::shared::progress_tree(trace);
+                let progress = crate::shared::progress_tree(trace != 0);
                 let sub_progress = progress.add_child(name);
+                init_tracing(trace, false, Some(&progress))?;
 
                 use crate::shared::{self, STANDARD_RANGE};
                 let handle = shared::setup_line_renderer_range(&progress, range.into().unwrap_or(STANDARD_RANGE));
 
                 let mut out = Vec::<u8>::new();
-                let res = run(progress::DoOrDiscard::from(Some(sub_progress)), &mut out, &mut stderr());
+                let res = gix::trace::coarse!("run")
+                    .into_scope(|| run(progress::DoOrDiscard::from(Some(sub_progress)), &mut out, &mut stderr()));
                 handle.shutdown_and_wait();
                 std::io::Write::write_all(&mut stdout(), &out)?;
                 res
@@ -94,44 +98,164 @@ pub mod pretty {
     }
 
     #[cfg(feature = "tracing")]
-    fn init_tracing(
-        enable: bool,
-        reverse_lines: bool,
-        progress: &gix::progress::prodash::tree::Root,
-    ) -> anyhow::Result<()> {
-        if enable {
-            let processor = tracing_forest::Printer::new().formatter({
-                let progress = std::sync::Mutex::new(progress.add_child("tracing"));
-                move |tree: &tracing_forest::tree::Tree| -> Result<String, std::fmt::Error> {
-                    use gix::Progress;
-                    use tracing_forest::Formatter;
-                    let progress = &mut progress.lock().unwrap();
-                    let tree = tracing_forest::printer::Pretty.fmt(tree)?;
-                    if reverse_lines {
-                        for line in tree.lines().rev() {
-                            progress.info(line.into());
-                        }
-                    } else {
-                        for line in tree.lines() {
-                            progress.info(line.into());
-                        }
-                    }
-                    Ok(String::new())
-                }
-            });
-            use tracing_subscriber::layer::SubscriberExt;
-            let subscriber = tracing_subscriber::Registry::default().with(tracing_forest::ForestLayer::from(processor));
-            tracing::subscriber::set_global_default(subscriber)?;
-        } else {
-            tracing::subscriber::set_global_default(tracing_subscriber::Registry::default())?;
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TraceFormat {
+        Forest,
+        Flat,
+    }
+
+    #[cfg(feature = "tracing")]
+    fn trace_settings(trace: u8) -> Option<(TraceFormat, tracing_subscriber::filter::LevelFilter)> {
+        use tracing_subscriber::filter::LevelFilter;
+
+        match trace {
+            1 => Some((TraceFormat::Forest, LevelFilter::INFO)),
+            2 => Some((TraceFormat::Forest, LevelFilter::DEBUG)),
+            3 => Some((TraceFormat::Flat, LevelFilter::DEBUG)),
+            4 => Some((TraceFormat::Flat, LevelFilter::TRACE)),
+            _ => None,
         }
+    }
+
+    #[cfg(feature = "tracing")]
+    struct TraceProgress {
+        progress: std::sync::Mutex<prodash::tree::Item>,
+        reverse_lines: bool,
+    }
+
+    #[cfg(feature = "tracing")]
+    struct TraceProgressWriter<'a> {
+        progress: std::sync::MutexGuard<'a, prodash::tree::Item>,
+        buf: Vec<u8>,
+        reverse_lines: bool,
+    }
+
+    #[cfg(feature = "tracing")]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceProgress {
+        type Writer = TraceProgressWriter<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TraceProgressWriter {
+                progress: self.progress.lock().expect("trace progress lock is not poisoned"),
+                buf: Vec::new(),
+                reverse_lines: self.reverse_lines,
+            }
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    impl std::io::Write for TraceProgressWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    impl Drop for TraceProgressWriter<'_> {
+        fn drop(&mut self) {
+            use gix::Progress;
+
+            let text = String::from_utf8_lossy(&self.buf);
+            if self.reverse_lines {
+                for line in text.lines().rev() {
+                    self.progress.info(line.into());
+                }
+            } else {
+                for line in text.lines() {
+                    self.progress.info(line.into());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(crate) fn init_tracing(
+        trace: u8,
+        reverse_lines: bool,
+        progress: Option<&gix::progress::prodash::tree::Root>,
+    ) -> anyhow::Result<()> {
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        let Some((format, level)) = trace_settings(trace) else {
+            anyhow::ensure!(trace == 0, "trace level must be between zero and four");
+            return Ok(());
+        };
+        match (format, progress) {
+            (TraceFormat::Forest, Some(progress)) => {
+                let processor = tracing_forest::Printer::new().formatter({
+                    let progress = std::sync::Mutex::new(progress.add_child("tracing"));
+                    move |tree: &tracing_forest::tree::Tree| -> Result<String, std::fmt::Error> {
+                        use gix::Progress;
+                        use tracing_forest::Formatter;
+                        let progress = &mut progress.lock().expect("trace progress lock is not poisoned");
+                        let tree = tracing_forest::printer::Pretty.fmt(tree)?;
+                        if reverse_lines {
+                            for line in tree.lines().rev() {
+                                progress.info(line.into());
+                            }
+                        } else {
+                            for line in tree.lines() {
+                                progress.info(line.into());
+                            }
+                        }
+                        Ok(String::new())
+                    }
+                });
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::Registry::default()
+                        .with(tracing_forest::ForestLayer::from(processor).with_filter(level)),
+                )?;
+            }
+            (TraceFormat::Forest, None) => {
+                let printer = tracing_forest::Printer::new().writer(tracing_forest::printer::MakeStderr);
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::Registry::default()
+                        .with(tracing_forest::ForestLayer::from(printer).with_filter(level)),
+                )?;
+            }
+            (TraceFormat::Flat, Some(progress)) => {
+                let writer = TraceProgress {
+                    progress: std::sync::Mutex::new(progress.add_child("tracing")),
+                    reverse_lines,
+                };
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::Registry::default().with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(writer)
+                            .with_filter(level),
+                    ),
+                )?;
+            }
+            (TraceFormat::Flat, None) => {
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::Registry::default()
+                        .with(tracing_subscriber::fmt::layer().with_writer(stderr).with_filter(level)),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    pub(crate) fn init_tracing(
+        trace: u8,
+        _reverse_lines: bool,
+        _progress: Option<&gix::progress::prodash::tree::Root>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(trace == 0, "tracing support is not compiled in");
         Ok(())
     }
 
     #[cfg(not(feature = "small"))]
     pub fn prepare_and_run<T: Send + 'static>(
         name: &str,
-        trace: bool,
+        trace: u8,
         verbose: bool,
         progress: bool,
         #[cfg_attr(not(feature = "prodash-render-tui"), allow(unused_variables))] progress_keep_open: bool,
@@ -148,15 +272,17 @@ pub mod pretty {
 
         match (verbose, progress) {
             (false, false) => {
+                init_tracing(trace, false, None)?;
                 let stdout = stdout();
                 let mut stdout_lock = stdout.lock();
-                run(progress::DoOrDiscard::from(None), &mut stdout_lock, &mut stderr())
+                gix::trace::coarse!("run")
+                    .into_scope(|| run(progress::DoOrDiscard::from(None), &mut stdout_lock, &mut stderr()))
             }
             (true, false) => {
                 use crate::shared::{self, STANDARD_RANGE};
-                let progress = shared::progress_tree(trace);
+                let progress = shared::progress_tree(trace != 0);
                 let sub_progress = progress.add_child(name);
-                init_tracing(trace, false, &progress)?;
+                init_tracing(trace, false, Some(&progress))?;
 
                 let handle = shared::setup_line_renderer_range(&progress, range.into().unwrap_or(STANDARD_RANGE));
 
@@ -211,12 +337,13 @@ pub mod pretty {
                 let thread = std::thread::spawn({
                     let name = name.to_owned();
                     move || {
-                        let _trace = init_tracing(trace, true, &progress).ok();
                         // We might have something interesting to show, which would be hidden by the alternate screen if there is a progress TUI
                         // We know that the printing happens at the end, so this is fine.
                         let mut out = Vec::new();
-                        let res = gix::trace::coarse!("run", name = name).into_scope(|| {
-                            run(progress::DoOrDiscard::from(Some(sub_progress)), &mut out, &mut stderr())
+                        let res = init_tracing(trace, true, Some(&progress)).and_then(|()| {
+                            gix::trace::coarse!("run", name = name).into_scope(|| {
+                                run(progress::DoOrDiscard::from(Some(sub_progress)), &mut out, &mut stderr())
+                            })
                         });
                         tx.send(Event::ComputationDone(res, out)).ok();
                     }
@@ -241,6 +368,51 @@ pub mod pretty {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "tracing"))]
+    mod tests {
+        use std::io::Write;
+
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        use super::{TraceFormat, TraceProgress, trace_settings};
+
+        #[test]
+        fn trace_repetitions_choose_format_and_level() {
+            assert_eq!(trace_settings(0), None);
+            assert_eq!(trace_settings(1), Some((TraceFormat::Forest, LevelFilter::INFO)));
+            assert_eq!(trace_settings(2), Some((TraceFormat::Forest, LevelFilter::DEBUG)));
+            assert_eq!(trace_settings(3), Some((TraceFormat::Flat, LevelFilter::DEBUG)));
+            assert_eq!(trace_settings(4), Some((TraceFormat::Flat, LevelFilter::TRACE)));
+            assert_eq!(trace_settings(5), None);
+        }
+
+        #[test]
+        fn flat_traces_are_buffered_as_complete_progress_lines() -> Result<(), Box<dyn std::error::Error>> {
+            let progress = prodash::tree::Root::new();
+            let writer = TraceProgress {
+                progress: std::sync::Mutex::new(progress.add_child("tracing")),
+                reverse_lines: true,
+            };
+            {
+                let mut line = writer.make_writer();
+                line.write_all(b"first")?;
+                line.write_all(b"\nsecond\n")?;
+            }
+            let mut messages = Vec::new();
+            progress.copy_messages(&mut messages);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.message.as_str())
+                    .collect::<Vec<_>>(),
+                ["second", "first"],
+                "the renderer receives whole lines in its display order"
+            );
+            Ok(())
         }
     }
 }

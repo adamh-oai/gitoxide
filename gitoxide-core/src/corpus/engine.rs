@@ -21,6 +21,7 @@ pub type ProgressItem = gix::progress::DoOrDiscard<gix::progress::prodash::tree:
 pub struct State {
     pub progress: ProgressItem,
     pub gitoxide_version: String,
+    pub trace: u8,
     pub trace_to_progress: bool,
     pub reverse_trace_lines: bool,
 }
@@ -78,6 +79,9 @@ impl Engine {
         dry_run: bool,
     ) -> anyhow::Result<()> {
         let start = Instant::now();
+        let trace = self.state.trace;
+        let trace_to_progress = self.state.trace_to_progress;
+        let reverse_trace_lines = self.state.reverse_trace_lines;
         let repo_progress = &mut self.state.progress;
         let threads = gix::parallel::num_threads(threads);
         let db_path = self.con.path().expect("opened from path on disk").to_owned();
@@ -108,8 +112,9 @@ impl Engine {
                 let mut run_progress = repo_progress.add_child("set later");
                 let (_guard, current_id) = corpus::trace::override_thread_subscriber(
                     db_path.as_str(),
-                    self.state.trace_to_progress.then(|| repo_progress.add_child("trace")),
-                    self.state.reverse_trace_lines,
+                    trace,
+                    trace_to_progress.then(|| repo_progress.add_child("trace")),
+                    reverse_trace_lines,
                 )?;
 
                 let mut num_errors = 0;
@@ -165,12 +170,14 @@ impl Engine {
                         let db_path = db_path.clone();
                         move |tid| {
                             let mut progress = gix::threading::lock(&shared_repo_progress);
-                            (
-                                // threaded printing is usually spammy, and lines interleave so it's useless.
-                                corpus::trace::override_thread_subscriber(db_path.as_str(), None, false),
-                                progress.add_child(format!("{tid}")),
-                                rusqlite::Connection::open(&db_path),
-                            )
+                            let mut lane_progress = progress.add_child(format!("{tid}"));
+                            let subscriber = corpus::trace::override_thread_subscriber(
+                                db_path.as_str(),
+                                trace,
+                                trace_to_progress.then(|| lane_progress.add_child("trace")),
+                                reverse_trace_lines,
+                            );
+                            (subscriber, lane_progress, rusqlite::Connection::open(&db_path))
                         }
                     },
                     |repo, (subscriber, progress, con), _threads_left, should_interrupt| -> anyhow::Result<()> {

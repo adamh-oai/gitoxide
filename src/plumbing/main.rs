@@ -33,23 +33,25 @@ pub mod async_util {
 
     pub fn prepare(
         verbose: bool,
-        trace: bool,
+        trace: u8,
         name: &str,
         range: impl Into<Option<ProgressRange>>,
-    ) -> (
+    ) -> anyhow::Result<(
         Option<prodash::render::line::JoinHandle>,
         gix_features::progress::DoOrDiscard<prodash::tree::Item>,
-    ) {
+    )> {
         use crate::shared::{self, STANDARD_RANGE};
         shared::init_env_logger();
 
         if verbose {
-            let progress = shared::progress_tree(trace);
+            let progress = shared::progress_tree(trace != 0);
             let sub_progress = progress.add_child(name);
+            crate::shared::pretty::init_tracing(trace, false, Some(&progress))?;
             let ui_handle = shared::setup_line_renderer_range(&progress, range.into().unwrap_or(STANDARD_RANGE));
-            (Some(ui_handle), Some(sub_progress).into())
+            Ok((Some(ui_handle), Some(sub_progress).into()))
         } else {
-            (None, None.into())
+            crate::shared::pretty::init_tracing(trace, false, None)?;
+            Ok((None, None.into()))
         }
     }
 }
@@ -59,21 +61,18 @@ pub fn main() -> Result<()> {
     let thread_limit = args.threads;
     let verbose = args.verbose;
     let format = args.format;
+    #[cfg(feature = "tracing")]
+    let trace = args.trace;
+    #[cfg(not(feature = "tracing"))]
+    let trace = 0;
     let cmd = args.cmd;
     #[cfg(feature = "tix")]
     let cmd = match cmd {
         Subcommands::Tix(command) if !command.requires_repository() => {
-            return command.run_without_repository(gix_tix::command::Invocation::GixTix);
+            return command.run_without_repository_with_trace(gix_tix::command::Invocation::GixTix, trace);
         }
         cmd => cmd,
     };
-    #[cfg_attr(not(feature = "tracing"), allow(unused_mut))]
-    #[cfg_attr(feature = "tracing", allow(unused_assignments))]
-    let mut trace = false;
-    #[cfg(feature = "tracing")]
-    {
-        trace = args.trace;
-    }
     let object_hash = args.object_hash;
     let config = args.config;
     let repository = args.repository;
@@ -165,9 +164,10 @@ pub fn main() -> Result<()> {
 
     match cmd {
         #[cfg(feature = "tix")]
-        Subcommands::Tix(command) => command.run_as(
-            repository(Mode::Lenient)?.into_sync(),
+        Subcommands::Tix(command) => command.run_with_repository_as_with_trace(
+            move || Ok(repository(Mode::Lenient)?.into_sync()),
             gix_tix::command::Invocation::GixTix,
+            trace,
         ),
         Subcommands::Env => prepare_and_run(
             "env",
@@ -597,15 +597,16 @@ pub fn main() -> Result<()> {
                 progress,
                 progress_keep_open,
                 core::corpus::PROGRESS_RANGE,
-                move |progress, _out, _err| {
+                move |root_progress, _out, _err| {
                     let mut engine = core::corpus::Engine::open_or_create(
                         db,
                         core::corpus::engine::State {
                             gitoxide_version: option_env!("GIX_VERSION")
                                 .ok_or_else(|| anyhow::anyhow!("GIX_VERSION must be set in build-script"))?
                                 .into(),
-                            progress,
-                            trace_to_progress: trace,
+                            progress: root_progress,
+                            trace,
+                            trace_to_progress: (auto_verbose || progress) && trace != 0,
                             reverse_trace_lines,
                         },
                     )?;
@@ -716,13 +717,31 @@ pub fn main() -> Result<()> {
                 },
             )
         }
-        Subcommands::ConfigTree => show_progress(),
-        Subcommands::Credential(cmd) => core::repository::credential(
-            repository(Mode::StrictWithGitInstallConfig).ok(),
-            match cmd {
-                credential::Subcommands::Fill => gix::credentials::program::main::Action::Get,
-                credential::Subcommands::Approve => gix::credentials::program::main::Action::Store,
-                credential::Subcommands::Reject => gix::credentials::program::main::Action::Erase,
+        Subcommands::ConfigTree => prepare_and_run(
+            "config-tree",
+            trace,
+            false,
+            false,
+            false,
+            None,
+            move |_progress, _out, _err| show_progress(),
+        ),
+        Subcommands::Credential(cmd) => prepare_and_run(
+            "credential",
+            trace,
+            false,
+            false,
+            false,
+            None,
+            move |_progress, _out, _err| {
+                core::repository::credential(
+                    repository(Mode::StrictWithGitInstallConfig).ok(),
+                    match cmd {
+                        credential::Subcommands::Fill => gix::credentials::program::main::Action::Get,
+                        credential::Subcommands::Approve => gix::credentials::program::main::Action::Store,
+                        credential::Subcommands::Reject => gix::credentials::program::main::Action::Erase,
+                    },
+                )
             },
         ),
         #[cfg(any(feature = "gitoxide-core-async-client", feature = "gitoxide-core-blocking-client"))]
@@ -733,16 +752,26 @@ pub fn main() -> Result<()> {
         }) => {
             use crate::plumbing::options::remote;
             match cmd {
-                remote::Subcommands::Url { all, push } => core::repository::remote::url(
-                    repository(Mode::LenientWithGitInstallConfig)?,
-                    name.as_deref(),
-                    if push {
-                        gix::remote::Direction::Push
-                    } else {
-                        gix::remote::Direction::Fetch
+                remote::Subcommands::Url { all, push } => prepare_and_run(
+                    "remote-url",
+                    trace,
+                    false,
+                    false,
+                    false,
+                    None,
+                    move |_progress, out, _err| {
+                        core::repository::remote::url(
+                            repository(Mode::LenientWithGitInstallConfig)?,
+                            name.as_deref(),
+                            if push {
+                                gix::remote::Direction::Push
+                            } else {
+                                gix::remote::Direction::Fetch
+                            },
+                            all,
+                            out,
+                        )
                     },
-                    all,
-                    std::io::stdout(),
                 ),
                 remote::Subcommands::Refs | remote::Subcommands::RefMap { .. } => {
                     let kind = match cmd {
@@ -789,7 +818,7 @@ pub fn main() -> Result<()> {
                             trace,
                             "remote-refs",
                             Some(core::repository::remote::refs::PROGRESS_RANGE),
-                        );
+                        )?;
                         futures_lite::future::block_on(core::repository::remote::refs(
                             repository(Mode::LenientWithGitInstallConfig)?,
                             kind,
@@ -1075,7 +1104,7 @@ pub fn main() -> Result<()> {
                     refs_directory,
                 } => {
                     let (_handle, progress) =
-                        async_util::prepare(verbose, trace, "pack-receive", core::pack::receive::PROGRESS_RANGE);
+                        async_util::prepare(verbose, trace, "pack-receive", core::pack::receive::PROGRESS_RANGE)?;
                     let fut = core::pack::receive(
                         protocol,
                         &url,
@@ -1796,21 +1825,29 @@ pub fn main() -> Result<()> {
                 )
             },
         ),
-        Subcommands::Completions { shell, out_dir } => {
-            let mut app = Args::command();
+        Subcommands::Completions { shell, out_dir } => prepare_and_run(
+            "completions",
+            trace,
+            false,
+            false,
+            false,
+            None,
+            move |_progress, out, _err| {
+                let mut app = Args::command();
 
-            let shell = shell
-                .or_else(clap_complete::Shell::from_env)
-                .ok_or_else(|| anyhow!("The shell could not be derived from the environment"))?;
+                let shell = shell
+                    .or_else(clap_complete::Shell::from_env)
+                    .ok_or_else(|| anyhow!("The shell could not be derived from the environment"))?;
 
-            let bin_name = app.get_name().to_owned();
-            if let Some(out_dir) = out_dir {
-                clap_complete::generate_to(shell, &mut app, bin_name, &out_dir)?;
-            } else {
-                clap_complete::generate(shell, &mut app, bin_name, &mut std::io::stdout());
-            }
-            Ok(())
-        }
+                let bin_name = app.get_name().to_owned();
+                if let Some(out_dir) = out_dir {
+                    clap_complete::generate_to(shell, &mut app, bin_name, &out_dir)?;
+                } else {
+                    clap_complete::generate(shell, &mut app, bin_name, out);
+                }
+                Ok(())
+            },
+        ),
     }?;
     Ok(())
 }
@@ -1842,6 +1879,48 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tracing")]
+    fn trace_is_repeatable_bounded_and_independent() {
+        use clap::Parser;
+
+        for (argument, expected) in [("env", 0), ("-t", 1), ("-tt", 2), ("-ttt", 3), ("-tttt", 4)] {
+            let arguments = if expected == 0 {
+                vec!["gix", argument]
+            } else {
+                vec!["gix", argument, "env"]
+            };
+            assert_eq!(
+                Args::try_parse_from(arguments)
+                    .expect("supported trace level parses")
+                    .trace,
+                expected
+            );
+        }
+        assert_eq!(
+            Args::try_parse_from(["gix", "--trace", "--trace", "env"])
+                .expect("the long flag can be repeated")
+                .trace,
+            2
+        );
+        assert_eq!(
+            Args::try_parse_from(["gix", "-ttttt", "env"])
+                .expect_err("trace output has only four levels")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert!(Args::try_parse_from(["gix", "-t", "--verbose", "env"]).is_ok());
+        assert!(Args::try_parse_from(["gix", "-t", "--no-verbose", "env"]).is_ok());
+        #[cfg(feature = "prodash-render-tui")]
+        assert!(Args::try_parse_from(["gix", "-t", "--progress", "env"]).is_ok());
+        assert_eq!(
+            Args::try_parse_from(["gix", "--threads", "2", "env"])
+                .expect("threads retains its long option")
+                .threads,
+            Some(2)
+        );
+    }
+
+    #[test]
     #[cfg(feature = "tix")]
     fn tix_aliases_are_visible_and_route_to_tix() {
         use clap::{CommandFactory, Parser};
@@ -1858,6 +1937,18 @@ mod tests {
             assert!(
                 matches!(args.cmd, Subcommands::Tix(_)),
                 "{name} routes to the tix command"
+            );
+        }
+
+        #[cfg(feature = "tracing")]
+        {
+            let args = Args::try_parse_from(["gix", "-tt", "tix"]).expect("tix inherits the outer trace flag");
+            assert_eq!(args.trace, 2);
+            assert_eq!(
+                Args::try_parse_from(["gix", "tix", "-t"])
+                    .expect_err("embedded tix does not repeat the trace flag")
+                    .kind(),
+                clap::error::ErrorKind::UnknownArgument
             );
         }
 

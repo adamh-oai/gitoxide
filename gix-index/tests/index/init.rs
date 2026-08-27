@@ -28,6 +28,14 @@ fn from_tree() -> crate::Result {
         let actual_state = State::from_tree(&tree_id, &odb, Default::default())?;
 
         compare_states(&actual_state, &expected_state, fixture);
+        assert_eq!(
+            actual_state.tree(),
+            expected_state.tree(),
+            "rebuilding an index from a tree must preserve Git's complete cached subtree graph in {fixture:?}"
+        );
+        actual_state
+            .verify_extensions(true, &odb)
+            .expect("generated cached subtrees must match their object database trees");
     }
     Ok(())
 }

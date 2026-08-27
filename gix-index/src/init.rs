@@ -9,6 +9,7 @@ pub mod from_tree {
     use crate::{
         Entry, PathStorage, State, Version,
         entry::{Flags, Mode, Stat},
+        extension,
     };
 
     /// The error returned by [State::from_tree()].
@@ -59,7 +60,8 @@ pub mod from_tree {
         /// entries. That was incomplete because [`Entry::cmp_filepaths()`] can order unrelated paths between a file
         /// and its conflicting child, for example `a`, `a.`, `a/x`.
         ///
-        /// **No extension data is currently produced**.
+        /// The returned index includes a complete, valid cache-tree extension assembled during
+        /// traversal, allowing Git to reuse unchanged subtree objects without traversing them again.
         pub fn from_tree<Find>(
             tree: &gix_hash::oid,
             objects: Find,
@@ -69,7 +71,7 @@ pub mod from_tree {
             Find: gix_object::Find,
         {
             let _span = gix_features::trace::coarse!("gix_index::State::from_tree()");
-            let mut delegate = CollectEntries::new(validate);
+            let mut delegate = CollectEntries::new(validate, tree);
             match depthfirst(tree.to_owned(), depthfirst::State::default(), &objects, &mut delegate) {
                 Ok(()) => {}
                 Err(gix_traverse::tree::breadthfirst::Error::Cancelled) => {
@@ -89,11 +91,33 @@ pub mod from_tree {
                 path_deque: _,
                 validate: _,
                 invalid_path,
+                cache_trees,
+                cache_tree_parents,
+                cache_tree_stack: _,
             } = delegate;
 
             if let Some((path, err)) = invalid_path {
                 return Err(Error::InvalidComponent { path, source: err });
             }
+
+            let mut cache_trees = cache_trees.into_iter().map(Some).collect::<Vec<_>>();
+            for index in (1..cache_trees.len()).rev() {
+                let mut child = cache_trees[index]
+                    .take()
+                    .expect("each cached subtree is assembled exactly once");
+                child.children.reverse();
+                let parent = cache_trees[cache_tree_parents[index]]
+                    .as_mut()
+                    .expect("a cached subtree's parent is assembled after its children");
+                parent.num_entries = parent
+                    .num_entries
+                    .and_then(|count| child.num_entries.and_then(|child_count| count.checked_add(child_count)));
+                parent.children.push(child);
+            }
+            let mut cache_tree = cache_trees[0]
+                .take()
+                .expect("tree traversal always starts with a root cache-tree");
+            cache_tree.children.reverse();
 
             Ok(State {
                 object_hash: tree.kind(),
@@ -102,7 +126,7 @@ pub mod from_tree {
                 entries,
                 path_backing,
                 is_sparse: false,
-                tree: None,
+                tree: Some(cache_tree),
                 link: None,
                 resolve_undo: None,
                 untracked: None,
@@ -120,10 +144,13 @@ pub mod from_tree {
         path_deque: VecDeque<BString>,
         validate: gix_validate::path::component::Options,
         invalid_path: Option<(BString, gix_validate::path::component::Error)>,
+        cache_trees: Vec<extension::Tree>,
+        cache_tree_parents: Vec<usize>,
+        cache_tree_stack: Vec<usize>,
     }
 
     impl CollectEntries {
-        pub fn new(validate: gix_validate::path::component::Options) -> CollectEntries {
+        pub fn new(validate: gix_validate::path::component::Options, tree: &gix_hash::oid) -> CollectEntries {
             CollectEntries {
                 entries: Vec::new(),
                 path_backing: Vec::new(),
@@ -131,6 +158,14 @@ pub mod from_tree {
                 path_deque: VecDeque::new(),
                 validate,
                 invalid_path: None,
+                cache_trees: vec![extension::Tree {
+                    name: Default::default(),
+                    id: tree.to_owned(),
+                    num_entries: Some(0),
+                    children: Vec::new(),
+                }],
+                cache_tree_parents: vec![0],
+                cache_tree_stack: vec![0],
             }
         }
 
@@ -182,6 +217,32 @@ pub mod from_tree {
             };
 
             self.entries.push(new_entry);
+
+            let directory_depth = self.path.iter().filter(|byte| **byte == b'/').count();
+            self.cache_tree_stack.truncate(directory_depth + 1);
+            let cache_tree = &mut self.cache_trees[*self
+                .cache_tree_stack
+                .last()
+                .expect("every index entry belongs to the root or a visited subtree")];
+            cache_tree.num_entries = cache_tree.num_entries.and_then(|count| count.checked_add(1));
+        }
+
+        fn add_tree(&mut self, entry: &tree::EntryRef<'_>) {
+            let directory_depth = self.path.iter().filter(|byte| **byte == b'/').count() + 1;
+            self.cache_tree_stack.truncate(directory_depth);
+            let parent = *self
+                .cache_tree_stack
+                .last()
+                .expect("every visited subtree belongs to the root or a visited parent");
+            let index = self.cache_trees.len();
+            self.cache_trees.push(extension::Tree {
+                name: entry.filename.as_bytes().into(),
+                id: entry.oid.to_owned(),
+                num_entries: Some(0),
+                children: Vec::new(),
+            });
+            self.cache_tree_parents.push(parent);
+            self.cache_tree_stack.push(index);
         }
 
         fn determine_action(&self) -> Action {
@@ -222,7 +283,8 @@ pub mod from_tree {
             }
         }
 
-        fn visit_tree(&mut self, _entry: &gix_object::tree::EntryRef<'_>) -> Action {
+        fn visit_tree(&mut self, entry: &gix_object::tree::EntryRef<'_>) -> Action {
+            self.add_tree(entry);
             self.determine_action()
         }
 

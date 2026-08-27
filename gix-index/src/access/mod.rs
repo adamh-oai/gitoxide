@@ -558,6 +558,7 @@ impl State {
         mode: entry::Mode,
         path: &BStr,
     ) {
+        self.invalidate_tree_path(path);
         let path = {
             let path_start = self.path_backing.len();
             self.path_backing.push_str(path);
@@ -605,9 +606,13 @@ impl State {
     pub fn remove_entries(&mut self, mut should_remove: impl FnMut(usize, &BStr, &mut Entry) -> bool) {
         let mut index = 0;
         let paths = &self.path_backing;
+        let tree = &mut self.tree;
         self.entries.retain_mut(|e| {
             let path = e.path_in(paths);
             let res = !should_remove(index, path, e);
+            if !res && let Some(tree) = tree.as_mut() {
+                tree.invalidate_path(path);
+            }
             index += 1;
             res
         });
@@ -620,7 +625,11 @@ impl State {
     /// Note that the memory used for the removed entries paths is not freed, as it's append-only, and
     /// that some extensions might refer to paths which are now deleted.
     pub fn remove_entry_at_index(&mut self, index: usize) -> Entry {
-        self.entries.remove(index)
+        let entry = self.entries.remove(index);
+        if let Some(tree) = self.tree.as_mut() {
+            tree.invalidate_path(entry.path_in(&self.path_backing));
+        }
+        entry
     }
 }
 
@@ -629,6 +638,18 @@ impl State {
     /// Access the `tree` extension.
     pub fn tree(&self) -> Option<&extension::Tree> {
         self.tree.as_ref()
+    }
+    /// Invalidate the cached directory containing `path` while retaining unaffected cached subtrees.
+    ///
+    /// Returns `true` if this state contains a cache-tree extension. Call this after changing an
+    /// entry's object ID, mode, or stage through a mutable entry accessor. Structural addition and
+    /// removal methods invalidate their affected paths automatically.
+    pub fn invalidate_tree_path(&mut self, path: &BStr) -> bool {
+        let Some(tree) = self.tree.as_mut() else {
+            return false;
+        };
+        tree.invalidate_path(path);
+        true
     }
     /// Remove the `tree` extension.
     pub fn remove_tree(&mut self) -> Option<extension::Tree> {

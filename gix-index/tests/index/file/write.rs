@@ -89,6 +89,42 @@ fn skip_hash() -> crate::Result {
 }
 
 #[test]
+fn invalidated_tree_extension_roundtrips_with_unaffected_subtrees() -> crate::Result {
+    let mut expected = Generated("v4_more_files_IEOT").open();
+    let original_child = expected
+        .tree()
+        .and_then(|tree| tree.children.iter().find(|child| child.name.as_slice() == b"d"))
+        .expect("the committed fixture contains a reusable directory subtree")
+        .clone();
+    assert!(
+        expected.invalidate_tree_path("new-root-file".into()),
+        "changing a root-level path must invalidate the existing root cache-tree"
+    );
+
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let actual_tree = actual
+        .tree()
+        .expect("an invalidated root must remain serialized as a TREE extension");
+    assert_eq!(
+        actual_tree.num_entries, None,
+        "the invalidated root must remain invalid after serialization"
+    );
+    assert_eq!(
+        actual_tree.children.iter().find(|child| child.name.as_slice() == b"d"),
+        Some(&original_child),
+        "valid unaffected subtrees must survive serialization without losing their object IDs"
+    );
+    Ok(())
+}
+
+#[test]
 fn fsmonitor_v1_extension_roundtrips() -> crate::Result {
     if gix_testtools::object_hash() != gix_hash::Kind::Sha1 {
         return Ok(());

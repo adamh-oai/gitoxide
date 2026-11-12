@@ -43,16 +43,15 @@ impl File {
     /// subtree content; more generally, `git status` and later commits can disagree about what is
     /// staged.
     ///
-    /// Until the tree-cache is updated on write (see [issue #2421]), remove it with
-    /// [`State::remove_tree()`](crate::State::remove_tree()) before writing whenever entries were
-    /// changed:
+    /// Structural entry additions and removals invalidate their affected cached paths automatically.
+    /// After modifying an entry's object ID, mode, or stage through a mutable accessor, call
+    /// [`State::invalidate_tree_path()`](crate::State::invalidate_tree_path()) before writing so
+    /// unrelated cached subtrees remain reusable:
     ///
     /// ```ignore
-    /// index.remove_tree();
+    /// index.invalidate_tree_path("changed/path".into());
     /// index.write(gix_index::write::Options::default())?;
     /// ```
-    ///
-    /// [issue #2421]: https://github.com/GitoxideLabs/gitoxide/issues/2421
     pub fn write(&mut self, options: write::Options) -> Result {
         use gix_error::{ErrorExt, ResultExt, bail, message};
 

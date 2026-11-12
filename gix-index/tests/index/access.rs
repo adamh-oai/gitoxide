@@ -7,6 +7,130 @@ fn icase_fixture() -> gix_index::File {
     Fixture::Generated("v2_icase_name_clashes").open()
 }
 
+fn deeper_tree_fixture() -> Option<gix_index::File> {
+    if gix_testtools::object_hash() != gix_hash::Kind::Sha1 {
+        return None;
+    }
+    Some(
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("v2_deeper_tree"),
+            gix_hash::Kind::Sha1,
+            false,
+            Default::default(),
+        )
+        .expect("the archived SHA-1 fixture contains a committed nested cache-tree"),
+    )
+}
+
+#[test]
+fn tree_path_invalidation_preserves_unaffected_subtrees() {
+    let Some(mut index) = deeper_tree_fixture() else {
+        return;
+    };
+    let original = index
+        .tree()
+        .expect("the committed fixture must contain a complete cache-tree")
+        .clone();
+    let original_sibling = original
+        .children
+        .iter()
+        .find(|child| child.name.as_slice() == b"sub")
+        .expect("the fixture must contain an unaffected sibling subtree")
+        .clone();
+
+    assert!(
+        index.invalidate_tree_path("d/nested/new-file".into()),
+        "an existing cache-tree must report that it was invalidated"
+    );
+
+    let tree = index
+        .tree()
+        .expect("path invalidation must preserve the TREE extension");
+    assert_eq!(tree.num_entries, None, "the root tree must be invalidated");
+    let changed = tree
+        .children
+        .iter()
+        .find(|child| child.name.as_slice() == b"d")
+        .expect("the changed directory must remain available for partial reuse");
+    assert_eq!(changed.num_entries, None, "the changed directory must be invalidated");
+    let nested = changed
+        .children
+        .iter()
+        .find(|child| child.name.as_slice() == b"nested")
+        .expect("the changed nested directory must remain available");
+    assert_eq!(nested.num_entries, None, "every changed ancestor must be invalidated");
+    assert_eq!(
+        tree.children.iter().find(|child| child.name.as_slice() == b"sub"),
+        Some(&original_sibling),
+        "unaffected sibling subtrees must retain their valid IDs and cached entry counts"
+    );
+}
+
+#[test]
+fn tree_path_invalidation_removes_a_replaced_directory() {
+    let Some(mut index) = deeper_tree_fixture() else {
+        return;
+    };
+
+    assert!(index.invalidate_tree_path("d".into()));
+
+    let tree = index.tree().expect("the root TREE extension must remain present");
+    assert_eq!(tree.num_entries, None, "the changed root must be invalidated");
+    assert!(
+        tree.children.iter().all(|child| child.name.as_slice() != b"d"),
+        "a directory replaced by a file must not retain its obsolete subtree"
+    );
+    assert!(
+        tree.children
+            .iter()
+            .any(|child| child.name.as_slice() == b"sub" && child.num_entries.is_some()),
+        "an unrelated sibling directory must remain cached"
+    );
+}
+
+#[test]
+fn structural_entry_changes_invalidate_only_affected_cached_subtrees() {
+    let Some(mut added) = deeper_tree_fixture() else {
+        return;
+    };
+    let object_id = added.entries()[0].id;
+    added.dangerously_push_entry(
+        Default::default(),
+        object_id,
+        gix_index::entry::Flags::empty(),
+        gix_index::entry::Mode::FILE,
+        "d/nested/new-file".into(),
+    );
+    let added_tree = added.tree().expect("adding an entry must retain the TREE extension");
+    assert_eq!(added_tree.num_entries, None, "adding an entry invalidates the root");
+    assert!(
+        added_tree
+            .children
+            .iter()
+            .any(|child| child.name.as_slice() == b"sub" && child.num_entries.is_some()),
+        "adding an entry must retain valid unrelated cached subtrees"
+    );
+
+    let mut removed = deeper_tree_fixture().expect("the SHA-1 archive was already loaded above");
+    removed.remove_entries(|_, path, _| path == "d/nested/1");
+    let removed_tree = removed
+        .tree()
+        .expect("removing an entry must retain the TREE extension");
+    let changed = removed_tree
+        .children
+        .iter()
+        .find(|child| child.name.as_slice() == b"d")
+        .expect("the changed directory must remain cached");
+    assert_eq!(changed.num_entries, None, "removing an entry invalidates its directory");
+    assert!(
+        removed_tree
+            .children
+            .iter()
+            .any(|child| child.name.as_slice() == b"sub" && child.num_entries.is_some()),
+        "removing an entry must retain valid unrelated cached subtrees"
+    );
+}
+
 #[test]
 fn entry_by_path() {
     let file = icase_fixture();

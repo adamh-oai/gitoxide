@@ -1,4 +1,6 @@
-use crate::extension::Signature;
+use bstr::{BStr, ByteSlice};
+
+use crate::extension::{Signature, Tree};
 
 /// The signature for tree extensions
 pub const SIGNATURE: Signature = *b"TREE";
@@ -10,6 +12,33 @@ mod decode;
 pub use decode::decode;
 
 mod write;
+
+impl Tree {
+    /// Invalidate the cached directory containing `path` and each of its ancestors.
+    ///
+    /// Cached sibling directories remain valid. If `path` names a cached directory itself,
+    /// remove that directory because the index entry may now replace it with a file.
+    pub fn invalidate_path(&mut self, path: &BStr) {
+        self.num_entries = None;
+
+        let Some((component, remainder)) = path.split_once_str("/") else {
+            if let Ok(position) = self
+                .children
+                .binary_search_by(|child| child.name.as_slice().cmp(path.as_ref()))
+            {
+                self.children.remove(position);
+            }
+            return;
+        };
+
+        if let Ok(position) = self
+            .children
+            .binary_search_by(|child| child.name.as_slice().cmp(component))
+        {
+            self.children[position].invalidate_path(remainder.as_bstr());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

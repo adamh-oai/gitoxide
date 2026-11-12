@@ -90,6 +90,267 @@ fn skip_hash() -> TestResult {
 }
 
 #[test]
+fn invalidated_tree_extension_roundtrips_with_unaffected_subtrees() -> TestResult {
+    let mut expected = Generated("v4_more_files_IEOT").open();
+    let original_child = expected
+        .tree()
+        .and_then(|tree| tree.children.iter().find(|child| child.name.as_slice() == b"d"))
+        .expect("the committed fixture contains a reusable directory subtree")
+        .clone();
+    assert!(
+        expected.invalidate_tree_path("new-root-file".into()),
+        "changing a root-level path must invalidate the existing root cache-tree"
+    );
+
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let actual_tree = actual
+        .tree()
+        .expect("an invalidated root must remain serialized as a TREE extension");
+    assert_eq!(
+        actual_tree.num_entries, None,
+        "the invalidated root must remain invalid after serialization"
+    );
+    assert_eq!(
+        actual_tree.children.iter().find(|child| child.name.as_slice() == b"d"),
+        Some(&original_child),
+        "valid unaffected subtrees must survive serialization without losing their object IDs"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_v1_extension_roundtrips() -> TestResult {
+    if gix_testtools::object_hash() != gix_hash::Kind::Sha1 {
+        return Ok(());
+    }
+
+    let expected = Loose("FSMN").open();
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+
+    let (actual, _) = State::from_bytes(&encoded, FileTime::now(), gix_hash::Kind::Sha1, Default::default())?;
+    assert!(
+        actual.fs_monitor().is_some(),
+        "writing an index must preserve its existing v1 fsmonitor extension"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_v2_token_and_dirty_bitmap_roundtrip() -> TestResult {
+    let mut expected = Generated("v2_more_files").open();
+    let mut dirty = vec![false; expected.entries().len()];
+    dirty[1] = true;
+    dirty[4] = true;
+    expected.set_fs_monitor(
+        extension::FsMonitor::from_token("awacs-git-v2:owner:filesystem:snapshot:cursor", &dirty)
+            .expect("fixture entry count must fit in a Git index bitmap"),
+    );
+
+    let mut encoded = Vec::new();
+    expected.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let monitor = actual
+        .fs_monitor()
+        .expect("writing an index must preserve its existing v2 fsmonitor extension");
+    assert_eq!(
+        monitor.token(),
+        Some("awacs-git-v2:owner:filesystem:snapshot:cursor".into()),
+        "the opaque fsmonitor cursor must remain unchanged"
+    );
+
+    let mut dirty_entries = Vec::new();
+    assert_eq!(
+        monitor.for_each_dirty_entry(|index| {
+            dirty_entries.push(index);
+            Some(())
+        }),
+        Some(()),
+        "the serialized dirty-entry bitmap must remain valid"
+    );
+    assert_eq!(
+        dirty_entries,
+        vec![1, 4],
+        "dirty index positions must survive serialization"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_bitmap_tracks_insertions_removals_and_sorting() -> TestResult {
+    let mut index = Generated("v2_more_files").open();
+    let mut dirty = vec![false; index.entries().len()];
+    dirty[1] = true;
+    index.set_fs_monitor(
+        extension::FsMonitor::from_token("cursor", &dirty).expect("fixture entry count must fit in a Git index bitmap"),
+    );
+    let object_id = index.entries()[0].id;
+
+    index.edit_preserving_fs_monitor(|state| {
+        state.remove_entry_at_index(0);
+        state.dangerously_push_entry(
+            entry::Stat::default(),
+            object_id,
+            entry::Flags::empty(),
+            entry::Mode::FILE,
+            "aa".into(),
+        );
+        state.sort_entries();
+    });
+
+    let mut encoded = Vec::new();
+    index.write_to(&mut encoded, Options::default())?;
+    let (actual, _) = State::from_bytes(
+        &encoded,
+        FileTime::now(),
+        gix_testtools::object_hash(),
+        Default::default(),
+    )?;
+    let mut dirty_paths = Vec::new();
+    actual
+        .fs_monitor()
+        .expect("editing entries must preserve the fsmonitor extension")
+        .for_each_dirty_entry(|index| {
+            dirty_paths.push(actual.entries()[index].path(&actual).to_owned());
+            Some(())
+        })
+        .expect("remapped dirty-entry bitmap must remain valid");
+    assert_eq!(
+        dirty_paths,
+        vec![bstr::BString::from("aa"), bstr::BString::from("b")],
+        "new entries and previously dirty entries must stay dirty after removal and sorting"
+    );
+    assert!(
+        index
+            .entries()
+            .iter()
+            .all(|entry| !entry.flags.contains(entry::Flags::FSMONITOR_VALID)),
+        "temporary fsmonitor validity flags must not leak into gitoxide status operations"
+    );
+    Ok(())
+}
+
+#[test]
+fn fsmonitor_state_can_be_inherited_by_a_rebuilt_index() -> TestResult {
+    let mut source = Generated("v2_more_files").open();
+    let mut dirty = vec![false; source.entries().len()];
+    dirty[1] = true;
+    source.set_fs_monitor(
+        extension::FsMonitor::from_token("retained-cursor", &dirty)
+            .expect("fixture entry count must fit in a Git index bitmap"),
+    );
+
+    let mut rebuilt = Generated("v2_more_files").open();
+    rebuilt.entries_mut()[2].id = gix_hash::ObjectId::null(gix_testtools::object_hash());
+    rebuilt.inherit_fs_monitor_from(&source);
+
+    let monitor = rebuilt
+        .fs_monitor()
+        .expect("a rebuilt index must inherit the old fsmonitor extension");
+    assert_eq!(monitor.token(), Some("retained-cursor".into()));
+    let mut dirty_entries = Vec::new();
+    monitor
+        .for_each_dirty_entry(|index| {
+            dirty_entries.push(index);
+            Some(())
+        })
+        .expect("inherited dirty-entry bitmap must remain valid");
+    assert_eq!(
+        dirty_entries,
+        vec![1, 2],
+        "previously dirty entries and changed object IDs must both be invalidated"
+    );
+    Ok(())
+}
+
+#[test]
+fn untracked_cache_extensions_roundtrip() -> TestResult {
+    let object_hash = gix_testtools::object_hash();
+    let mut fixtures = vec![
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_empty"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_populated"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+        gix_index::File::at(
+            crate::fixture_index_path_needs_archive("untracked_cache_nested"),
+            object_hash,
+            false,
+            Default::default(),
+        )?,
+    ];
+    if object_hash == gix_hash::Kind::Sha1 {
+        fixtures.push(Loose("UNTR").open());
+        fixtures.push(Loose("UNTR-with-oids").open());
+    }
+
+    for expected in fixtures {
+        let expected_cache = expected
+            .untracked()
+            .expect("each fixture must contain an untracked-cache extension");
+        let mut encoded = Vec::new();
+        expected.write_to(&mut encoded, Options::default())?;
+        let (actual, _) = State::from_bytes(&encoded, FileTime::now(), object_hash, Default::default())?;
+        let actual_cache = actual
+            .untracked()
+            .expect("writing an index must preserve its untracked-cache extension");
+        assert_eq!(
+            format!("{actual_cache:?}"),
+            format!("{expected_cache:?}"),
+            "the identifier, exclude metadata, directory graph, bitmaps, stats, and object IDs must survive"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn untracked_cache_can_be_inherited_by_a_rebuilt_index() -> TestResult {
+    let object_hash = gix_testtools::object_hash();
+    let source = gix_index::File::at(
+        crate::fixture_index_path_needs_archive("untracked_cache_nested"),
+        object_hash,
+        false,
+        Default::default(),
+    )?;
+    let mut rebuilt = Generated("v2_more_files").open();
+    assert!(
+        rebuilt.untracked().is_none(),
+        "the rebuilt index starts without an untracked cache"
+    );
+
+    rebuilt.inherit_untracked_from(&source);
+    let expected_cache = source.untracked().expect("the source fixture has an untracked cache");
+    let actual_cache = rebuilt
+        .untracked()
+        .expect("a rebuilt index must inherit the source untracked-cache extension");
+    assert_eq!(
+        format!("{actual_cache:?}"),
+        format!("{expected_cache:?}"),
+        "rebuilding the index must preserve the complete nested untracked-cache state"
+    );
+    Ok(())
+}
+
+#[test]
 fn roundtrips_sparse_index() -> TestResult {
     // NOTE: I initially tried putting these fixtures into the main roundtrip test above,
     // but the call to `compare_raw_bytes` panics. It seems like git is using a different

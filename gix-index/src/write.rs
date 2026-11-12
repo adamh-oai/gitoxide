@@ -129,6 +129,22 @@ impl State {
                 self.is_sparse()
                     .then(|| extension::sparse::write_to(write).map(|_| extension::sparse::SIGNATURE))
             },
+            &|write| {
+                extensions
+                    .should_write(extension::untracked_cache::SIGNATURE)
+                    .and_then(|signature| {
+                        self.untracked()
+                            .map(|cache| cache.write_to(write, self.object_hash).map(|_| signature))
+                    })
+            },
+            &|write| {
+                extensions
+                    .should_write(extension::fs_monitor::SIGNATURE)
+                    .and_then(|signature| {
+                        self.fs_monitor()
+                            .map(|monitor| monitor.write_to(write).map(|_| signature))
+                    })
+            },
         ];
 
         let mut offset_to_previous_ext = offset_to_extensions;

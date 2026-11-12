@@ -81,6 +81,10 @@ impl From<crate::Handle> for Proxy<crate::Handle> {
 
 /// Memory Access
 impl<T> Proxy<T> {
+    fn contains_in_memory(&self, id: &gix_hash::oid) -> bool {
+        self.memory.as_ref().is_some_and(|map| map.borrow().contains_key(id))
+    }
+
     /// Take all the objects in memory so far, with the memory storage itself and return it.
     ///
     /// The instance will remain in a state where it won't be able to store objects in memory at all,
@@ -164,7 +168,18 @@ where
     T: gix_object::Exists,
 {
     fn exists(&self, id: &gix_hash::oid) -> bool {
-        self.memory.as_ref().is_some_and(|map| map.borrow().contains_key(id)) || self.inner.exists(id)
+        self.contains_in_memory(id) || self.inner.exists(id)
+    }
+}
+
+impl<S> Proxy<Cache<crate::store::Handle<S>>>
+where
+    S: Deref<Target = crate::Store> + Clone,
+{
+    /// Check memory, loose objects and known packs for a duplicate before writing `id`.
+    /// If another process added a pack since the last scan, the caller may write a loose copy.
+    pub fn exists_for_write(&self, id: &gix_hash::oid) -> bool {
+        self.contains_in_memory(id) || self.inner.contains_with_refresh(id, crate::store::RefreshMode::Never)
     }
 }
 

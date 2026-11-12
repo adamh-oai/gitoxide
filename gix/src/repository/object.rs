@@ -230,21 +230,7 @@ impl crate::Repository {
     /// Note that we hash the object in memory to avoid storing objects that are already present. That way,
     /// we avoid writing duplicate objects using slow disks that will eventually have to be garbage collected.
     pub fn write_object(&self, object: impl gix_object::WriteTo) -> Result<Id<'_>> {
-        let mut buf = self.empty_reusable_buffer();
-        object.write_to(buf.deref_mut()).or_error()?;
-
-        self.write_object_inner(&buf, object.kind())
-    }
-
-    fn write_object_inner(&self, buf: &[u8], kind: gix_object::Kind) -> Result<Id<'_>> {
-        let oid = gix_object::compute_hash(self.object_hash(), kind, buf)?;
-        if self.objects.exists(&oid) {
-            return Ok(oid.attach(self));
-        }
-
-        self.objects
-            .write_buf_with_known_id(kind, buf, oid)
-            .map(|oid| oid.attach(self))
+        self.write(&object).map(|oid| oid.attach(self))
     }
 
     /// Write a blob from the given `bytes`.
@@ -265,13 +251,7 @@ impl crate::Repository {
     /// # Ok(()) }
     /// ```
     pub fn write_blob(&self, bytes: impl AsRef<[u8]>) -> Result<Id<'_>> {
-        let bytes = bytes.as_ref();
-        let oid = gix_object::compute_hash(self.object_hash(), gix_object::Kind::Blob, bytes)?;
-        if self.objects.exists(&oid) {
-            return Ok(oid.attach(self));
-        }
-        self.objects
-            .write_buf_with_known_id(gix_object::Kind::Blob, bytes, oid)
+        self.write_buf(gix_object::Kind::Blob, bytes.as_ref())
             .map(|oid| oid.attach(self))
     }
 
@@ -285,18 +265,7 @@ impl crate::Repository {
         let mut buf = self.empty_reusable_buffer();
         std::io::copy(&mut bytes, buf.deref_mut()).or_error()?;
 
-        self.write_blob_stream_inner(&buf)
-    }
-
-    fn write_blob_stream_inner(&self, buf: &[u8]) -> Result<Id<'_>> {
-        let oid = gix_object::compute_hash(self.object_hash(), gix_object::Kind::Blob, buf)?;
-        if self.objects.exists(&oid) {
-            return Ok(oid.attach(self));
-        }
-
-        self.objects
-            .write_buf_with_known_id(gix_object::Kind::Blob, buf, oid)
-            .map(|oid| oid.attach(self))
+        self.write_blob(&*buf)
     }
 }
 

@@ -5,7 +5,7 @@ use gix_error::{Message, OptionExt, ResultExt, bail, message, not_found};
 
 use gix_pack::cache::DecodeEntry;
 
-use crate::store::{handle, load_index};
+use crate::store::{IndexCtx, RefreshMode, handle, load_index};
 
 #[derive(Copy, Clone)]
 pub(crate) struct DeltaBaseRecursion<'a> {
@@ -274,14 +274,9 @@ where
     pub(crate) fn clear_cache(&self) {
         self.packed_object_count.borrow_mut().take();
     }
-}
 
-impl<S> gix_pack::Find for super::Handle<S>
-where
-    S: Deref<Target = super::Store> + Clone,
-{
     // TODO: make this method fallible to propagate index loading failures.
-    fn contains(&self, id: &gix_hash::oid) -> bool {
+    pub(crate) fn contains_with_refresh(&self, id: &gix_hash::oid, refresh_mode: RefreshMode) -> bool {
         let mut snapshot = self.snapshot.borrow_mut();
         loop {
             for (idx, index) in snapshot.indices.iter().enumerate() {
@@ -299,7 +294,10 @@ where
                 }
             }
 
-            match self.store.load_one_index(self.index_ctx(snapshot.marker)) {
+            match self.store.load_one_index(IndexCtx {
+                refresh_mode,
+                ..self.index_ctx(snapshot.marker)
+            }) {
                 Ok(Some(new_snapshot)) => {
                     *snapshot = new_snapshot;
                     self.clear_cache();
@@ -308,6 +306,15 @@ where
                 Err(_) => return false, // something went wrong, nothing we can communicate here with this trait. TODO: Maybe that should change?
             }
         }
+    }
+}
+
+impl<S> gix_pack::Find for super::Handle<S>
+where
+    S: Deref<Target = super::Store> + Clone,
+{
+    fn contains(&self, id: &gix_hash::oid) -> bool {
+        self.contains_with_refresh(id, self.refresh)
     }
 
     fn try_find_cached<'a>(

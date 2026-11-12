@@ -397,6 +397,46 @@ mod write_blob {
 }
 
 #[test]
+fn writes_use_known_packs_and_reads_discover_new_packs() -> TestResult {
+    let (repo, _tmp) = crate::repo_rw("make_packed_and_loose.sh")?;
+    let objects = repo.objects.store_ref();
+    let pack_dir = objects.path().join("pack");
+    let incoming = repo.git_dir().join("incoming-pack");
+    std::fs::rename(&pack_dir, &incoming)?;
+    std::fs::create_dir(&pack_dir)?;
+
+    let first_blob_id = repo.write_blob(b"first new blob")?;
+    let refreshes = objects.metrics().num_refreshes;
+    assert_eq!(refreshes, 1, "the first write discovers existing packs");
+    assert_eq!(repo.write_blob_stream(b"first new blob".as_slice())?, first_blob_id);
+    repo.write_object(gix_object::BlobRef {
+        data: b"second new blob",
+    })?;
+
+    let parent_id = repo
+        .head_commit()?
+        .parent_ids()
+        .next()
+        .expect("the fixture has a parent")
+        .detach();
+    std::fs::remove_dir(&pack_dir)?;
+    std::fs::rename(incoming, &pack_dir)?;
+    // The arriving pack already contains this blob. The writer can safely create a loose copy.
+    let loose = gix_odb::loose::Store::at(objects.path(), repo.object_hash());
+    let blob_id = repo.write_blob(b"hello\n")?;
+    assert!(loose.contains(&blob_id));
+    assert_eq!(objects.metrics().num_refreshes, refreshes);
+
+    assert_eq!(repo.find_commit(parent_id)?.id, parent_id);
+    assert_eq!(
+        objects.metrics().num_refreshes,
+        refreshes + 1,
+        "the read discovered the pack"
+    );
+    Ok(())
+}
+
+#[test]
 fn writes_avoid_io_using_duplicate_check() -> TestResult {
     let (mut repo, _tmp) = crate::repo_rw("make_packed_and_loose.sh")?;
     let store = gix::odb::loose::Store::at(repo.git_dir().join("objects"), repo.object_hash());

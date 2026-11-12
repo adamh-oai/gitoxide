@@ -323,6 +323,29 @@ fn untracked_cache_extensions_roundtrip() -> TestResult {
 }
 
 #[test]
+fn clearing_worktree_caches_keeps_the_entries_and_cache_tree() -> TestResult {
+    let mut index = Generated("v4_more_files_IEOT").open();
+    let tree = index.tree().expect("fixture has a cache tree").clone();
+    let entries = index.entries().len();
+    let source = gix_index::File::at(
+        crate::fixture_index_path_needs_archive("untracked_cache_nested"),
+        index.object_hash(),
+        false,
+        Default::default(),
+    )?;
+    index.inherit_untracked_from(&source);
+    assert!(index.untracked().is_some());
+    index.set_fs_monitor(extension::FsMonitor::from_token("cursor", &vec![false; entries]).unwrap());
+
+    index.clear_worktree_cache_extensions();
+    assert!(index.untracked().is_none());
+    assert!(index.fs_monitor().is_none());
+    assert_eq!(index.tree(), Some(&tree));
+    assert_eq!(index.entries().len(), entries);
+    Ok(())
+}
+
+#[test]
 fn untracked_cache_can_be_inherited_by_a_rebuilt_index() -> TestResult {
     let object_hash = gix_testtools::object_hash();
     let source = gix_index::File::at(

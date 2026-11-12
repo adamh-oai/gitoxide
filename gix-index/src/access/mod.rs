@@ -676,6 +676,14 @@ impl State {
         self.untracked.as_ref()
     }
 
+    /// Discard the filesystem monitor and untracked-cache extensions.
+    ///
+    /// Both describe a particular worktree. Clear them before installing caches from another index.
+    pub fn clear_worktree_cache_extensions(&mut self) {
+        self.fs_monitor = None;
+        self.untracked = None;
+    }
+
     /// Carry the untracked-cache extension from `source` into this rebuilt index.
     ///
     /// The caller must ensure both indexes describe the same worktree, since the cache contains

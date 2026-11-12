@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     ffi::OsStr,
     ops::Deref,
     path::{Path, PathBuf},
@@ -501,13 +501,14 @@ impl super::Store {
                 })
                 .transpose()?;
             if let Some((multi_index, mtime, flen)) = multi_index_info {
-                let index_names_in_multi_index: Vec<_> = multi_index.index_names().iter().map(AsRef::as_ref).collect();
+                let index_names_in_multi_index: HashSet<&Path> =
+                    multi_index.index_names().iter().map(AsRef::as_ref).collect();
                 let mut indices_not_in_multi_index: Vec<(Either, _, _)> = indices
                     .into_iter()
                     .filter_map(|(path, a, b)| {
                         (path != multi_index.path()
                             && !index_names_in_multi_index
-                                .contains(&Path::new(path.file_name().expect("file name present"))))
+                                .contains(Path::new(path.file_name().expect("file name present"))))
                         .then_some((Either::IndexPath(path), a, b))
                     })
                     .collect();
